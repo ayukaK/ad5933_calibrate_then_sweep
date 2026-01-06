@@ -24,6 +24,7 @@
  *   CONFIG_LOG_DEFAULT_LEVEL=3
  */
 
+//Test Message
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/i2c.h>
