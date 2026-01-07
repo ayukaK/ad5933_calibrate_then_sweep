@@ -16,6 +16,10 @@
  *  - I2C SDA/SCL + power/ground
  */
 
+
+// git config user.name "ayukaK"
+//git config user.email "akariyawasam50@gmail.com"
+
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/i2c.h>
