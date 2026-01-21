@@ -22,6 +22,11 @@
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/logging/log.h>
 #include <math.h>
+
+#ifndef PI
+#define PI 3.14159265358979323846
+#endif
+
 #include <stdint.h>
 
 LOG_MODULE_REGISTER(ad5933, LOG_LEVEL_INF);
@@ -312,13 +317,15 @@ int main(void)
 		double dre = (double)re;
 		double dim = (double)im;
 		double mag = sqrt((dre * dre) + (dim * dim));
-		double ph_deg = atan2(dim, dre) * (180.0 / M_PI);
+		double ph_deg = atan2(dim, dre) * (180.0 / PI);
+
 
 		uint32_t f = SWEEP_START_HZ + (uint32_t)i * SWEEP_STEP_HZ;
 
 		if (RCAL_OHM > 0.0) {
 			/* Gain factor = 1 / (RCAL * mag) */
-			double g = (mag > 0.0) ? (1.0 / (RCAL_OHM * mag)) : NAN;
+			double g = (mag > 0.0) ? (1.0 / (RCAL_OHM * mag)) : (double)NAN;
+
 			gain[i] = g;
 
 			/* In calibration mode, the impedance would be RCAL (sanity check) */
