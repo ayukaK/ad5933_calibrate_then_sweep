@@ -3,12 +3,15 @@
  *
  * What it does:
  *  - Scans I2C bus for AD5933 (0x0D or 0x0C) and selects it
- *  - Initializes AD5933
- *  - Performs a linear frequency sweep
- *  - Prints: f_hz, Re, Im, |DFT|, phase_deg
+ *  - Resets + configures AD5933
+ *  - Runs a LOG-SPACED sweep from SWEEP_START_HZ to SWEEP_STOP_HZ (SWEEP_POINTS points)
+ *    by manually reprogramming the start frequency each point (AD5933 linear sweep HW not used).
+ *  - Prints: idx,f_hz,Re,Im,mag,phase_deg
  *
- * Optional:
- *  - If you calibrate with a known resistor (RCAL_OHM), it prints |Z| too.
+ * Notes:
+ *  - This prints RAW DFT outputs (Re/Im) and derived magnitude/phase.
+ *  - The "Z_ohm" printed in CAL mode is a sanity check and will be ~RCAL_OHM by construction.
+ *    Proper impedance extraction needs a 2-pass calibration workflow (gain vs frequency).
  *
  * Hardware basics:
  *  - nRF52840 SDA/SCL must match overlay pins
@@ -21,26 +24,28 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/logging/log.h>
+
+#include <errno.h>
 #include <math.h>
+#include <stdint.h>
+#include <stdbool.h>
 
 #ifndef PI
 #define PI 3.14159265358979323846
 #endif
 
-#include <stdint.h>
-
 LOG_MODULE_REGISTER(ad5933, LOG_LEVEL_INF);
 
 /* ---------------- User sweep settings ---------------- */
 #define SWEEP_START_HZ   1000u
-#define SWEEP_STEP_HZ    1000u
-#define SWEEP_POINTS     100u
+#define SWEEP_STOP_HZ    100000u
+#define SWEEP_POINTS     30u
 
 /* Settling cycles: increase if your readings are unstable */
 #define SETTLING_CYCLES  100u
 
 /* If you do a calibration run with a known resistor (recommended),
- * set its value here (ohms). If you don't calibrate, leave 0.
+ * set its value here (ohms). If you don't calibrate, set to 0.0
  */
 #define RCAL_OHM         10000.0
 
@@ -154,7 +159,7 @@ static int wait_data_valid(uint32_t timeout_ms)
 
 static bool i2c_addr_acks(uint8_t addr)
 {
-	/* Probe with a register read of STATUS (most meaningful) */
+	/* Probe with a register read of STATUS */
 	uint8_t st = 0;
 	int ret = i2c_reg_read_byte(i2c_dev, addr, REG_STATUS, &st);
 	return (ret == 0);
@@ -164,8 +169,9 @@ static bool ad5933_detect(void)
 {
 	/* Common AD5933 7-bit addresses depending on ADDR strap */
 	const uint8_t candidates[] = { 0x0D, 0x0C };
+	const size_t n = sizeof(candidates) / sizeof(candidates[0]);
 
-	for (size_t i = 0; i < sizeof(candidates); i++) {
+	for (size_t i = 0; i < n; i++) {
 		uint8_t a = candidates[i];
 		if (i2c_addr_acks(a)) {
 			ad5933_addr = a;
@@ -201,32 +207,6 @@ static int ad5933_reset(uint8_t hb_range_pga, uint8_t clk_sel)
 	return 0;
 }
 
-static int ad5933_program_sweep(uint32_t start_hz, uint32_t step_hz, uint16_t points, uint16_t settling_cycles)
-{
-	/* AD5933 wants NUM_INCR = points-1 */
-	if (points < 2) return -EINVAL;
-
-	uint32_t start_code = freq_to_word(start_hz);
-	uint32_t inc_code   = freq_to_word(step_hz);
-	uint16_t num_incr   = (uint16_t)(points - 1);
-
-	int ret = w24(REG_START_FREQ_2, start_code);
-	if (ret) return ret;
-
-	ret = w24(REG_INC_FREQ_2, inc_code);
-	if (ret) return ret;
-
-	ret = w16(REG_NUM_INC_2, num_incr);
-	if (ret) return ret;
-
-	/* Settling: simplest form (no multiplier bits), just cycles in 14-bit field */
-	if (settling_cycles > 0x3FFF) settling_cycles = 0x3FFF;
-	ret = w16(REG_SETTLE_2, settling_cycles);
-	if (ret) return ret;
-
-	return 0;
-}
-
 static int ad5933_cmd(uint8_t hb_func, uint8_t hb_range_pga, uint8_t clk_sel)
 {
 	int ret = w8(REG_CTRL_HB, (uint8_t)(hb_func | hb_range_pga));
@@ -234,7 +214,40 @@ static int ad5933_cmd(uint8_t hb_func, uint8_t hb_range_pga, uint8_t clk_sel)
 	return w8(REG_CTRL_LB, clk_sel);
 }
 
-/* ---------- main ---------- */
+/* Program a single-point "sweep": INC=0, NUM_INCR=0, START=freq */
+static int ad5933_program_single(uint32_t f_hz, uint16_t settling_cycles)
+{
+	uint32_t start_code = freq_to_word(f_hz);
+
+	int ret = w24(REG_START_FREQ_2, start_code);
+	if (ret) return ret;
+
+	ret = w24(REG_INC_FREQ_2, 0);
+	if (ret) return ret;
+
+	ret = w16(REG_NUM_INC_2, 0);
+	if (ret) return ret;
+
+	/* Settling cycles in 14-bit field (no multiplier bits used here) */
+	if (settling_cycles > 0x3FFF) settling_cycles = 0x3FFF;
+	ret = w16(REG_SETTLE_2, settling_cycles);
+	if (ret) return ret;
+
+	return 0;
+}
+
+/* Build log-spaced frequency list */
+static void build_log_sweep(uint32_t *freqs, uint16_t n, uint32_t f_start, uint32_t f_stop)
+{
+	double log_fs = log10((double)f_start);
+	double log_fe = log10((double)f_stop);
+	double step = (log_fe - log_fs) / (double)(n - 1);
+
+	for (uint16_t i = 0; i < n; i++) {
+		double f = pow(10.0, log_fs + step * (double)i);
+		freqs[i] = (uint32_t)(f + 0.5);
+	}
+}
 
 int main(void)
 {
@@ -263,13 +276,17 @@ int main(void)
 		while (1) k_sleep(K_SECONDS(1));
 	}
 
-	ret = ad5933_program_sweep(SWEEP_START_HZ, SWEEP_STEP_HZ, SWEEP_POINTS, SETTLING_CYCLES);
+	static uint32_t freqs[SWEEP_POINTS];
+	build_log_sweep(freqs, SWEEP_POINTS, SWEEP_START_HZ, SWEEP_STOP_HZ);
+
+	/* Program first point */
+	ret = ad5933_program_single(freqs[0], SETTLING_CYCLES);
 	if (ret) {
-		LOG_ERR("program_sweep failed: %d", ret);
+		LOG_ERR("program_single failed: %d", ret);
 		while (1) k_sleep(K_SECONDS(1));
 	}
 
-	/* Start sequence */
+	/* Start sequence for first point */
 	ret = ad5933_cmd(HB_INIT_FREQ, hb_range_pga, clk_sel);
 	if (ret) {
 		LOG_ERR("INIT failed: %d", ret);
@@ -282,26 +299,23 @@ int main(void)
 		LOG_ERR("START failed: %d", ret);
 		while (1) k_sleep(K_SECONDS(1));
 	}
+	k_msleep(2);
 
-	/* Optional calibration:
-	 * If RCAL_OHM > 0, we treat the first sweep as calibration and compute gain per point.
-	 * Then you can re-run a second sweep for your unknown (R||C) without reflashing
-	 * (just reset/power-cycle after swapping DUT).
-	 */
+	/* Placeholder gain array (not used for true Z extraction in this simple version) */
 	static double gain[SWEEP_POINTS];
-	for (uint16_t i = 0; i < SWEEP_POINTS; i++) gain[i] = NAN;
+	for (uint16_t i = 0; i < SWEEP_POINTS; i++) gain[i] = (double)NAN;
 
 	LOG_INF("Format:");
 	if (RCAL_OHM > 0.0) {
-		LOG_INF("idx,f_hz,Re,Im,mag,phase_deg,Z_ohm   (CAL mode: connect RCAL=%.2f ohm)", RCAL_OHM);
+		LOG_INF("idx,f_hz,Re,Im,mag,phase_deg,Z_ohm   (CAL sanity mode: RCAL=%.2f ohm)", RCAL_OHM);
 	} else {
-		LOG_INF("idx,f_hz,Re,Im,mag,phase_deg        (RAW mode: no impedance calc)");
+		LOG_INF("idx,f_hz,Re,Im,mag,phase_deg        (RAW mode)");
 	}
 
 	for (uint16_t i = 0; i < SWEEP_POINTS; i++) {
 
 		/* Wait for data */
-		ret = wait_data_valid(2000);
+		ret = wait_data_valid(3000);
 		if (ret) {
 			LOG_ERR("Timeout waiting data at i=%u (ret=%d)", i, ret);
 			break;
@@ -319,17 +333,15 @@ int main(void)
 		double mag = sqrt((dre * dre) + (dim * dim));
 		double ph_deg = atan2(dim, dre) * (180.0 / PI);
 
-
-		uint32_t f = SWEEP_START_HZ + (uint32_t)i * SWEEP_STEP_HZ;
+		uint32_t f = freqs[i];
 
 		if (RCAL_OHM > 0.0) {
-			/* Gain factor = 1 / (RCAL * mag) */
+			/* Gain factor = 1 / (RCAL * mag) (sanity only in this file) */
 			double g = (mag > 0.0) ? (1.0 / (RCAL_OHM * mag)) : (double)NAN;
-
 			gain[i] = g;
 
-			/* In calibration mode, the impedance would be RCAL (sanity check) */
-			double z = (mag > 0.0) ? (1.0 / (g * mag)) : NAN;
+			/* This collapses to RCAL; included only as a sanity check */
+			double z = (mag > 0.0) ? (1.0 / (g * mag)) : (double)NAN;
 
 			LOG_INF("%u,%u,%d,%d,%.3f,%.2f,%.2f",
 				(unsigned)i, (unsigned)f, (int)re, (int)im, mag, ph_deg, z);
@@ -338,13 +350,27 @@ int main(void)
 				(unsigned)i, (unsigned)f, (int)re, (int)im, mag, ph_deg);
 		}
 
-		/* Step frequency (except after last point) */
+		/* Program + start next point */
 		if (i + 1 < SWEEP_POINTS) {
-			ret = ad5933_cmd(HB_INC_FREQ, hb_range_pga, clk_sel);
+			ret = ad5933_program_single(freqs[i + 1], SETTLING_CYCLES);
 			if (ret) {
-				LOG_ERR("INC failed at i=%u (ret=%d)", i, ret);
+				LOG_ERR("program_single failed at i=%u (ret=%d)", i, ret);
 				break;
 			}
+
+			ret = ad5933_cmd(HB_INIT_FREQ, hb_range_pga, clk_sel);
+			if (ret) {
+				LOG_ERR("INIT failed at i=%u (ret=%d)", i, ret);
+				break;
+			}
+			k_msleep(2);
+
+			ret = ad5933_cmd(HB_START_SWEEP, hb_range_pga, clk_sel);
+			if (ret) {
+				LOG_ERR("START failed at i=%u (ret=%d)", i, ret);
+				break;
+			}
+			k_msleep(2);
 		}
 	}
 
